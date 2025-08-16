@@ -1,0 +1,551 @@
+import { Component, Input, Output, EventEmitter, OnInit, OnDestroy, signal, computed } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { MatTableModule, MatTableDataSource } from '@angular/material/table';
+import { MatPaginatorModule, PageEvent, MatPaginator } from '@angular/material/paginator';
+import { MatSortModule, Sort, MatSort } from '@angular/material/sort';
+import { MatButtonModule } from '@angular/material/button';
+import { MatIconModule } from '@angular/material/icon';
+import { MatMenuModule } from '@angular/material/menu';
+import { MatTooltipModule } from '@angular/material/tooltip';
+import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
+import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatDialog } from '@angular/material/dialog';
+import { ViewChild } from '@angular/core';
+import { Subject } from 'rxjs';
+import { takeUntil, debounceTime, distinctUntilChanged } from 'rxjs/operators';
+
+import { 
+  TableMetadata, 
+  SortOption, 
+  FilterOption,
+  DataGridFilter
+} from './types';
+import { AdminDataService } from './admin-data.service';
+import { EditDialogComponent } from './edit-dialog.component';
+import { ConfirmDeleteDialogComponent } from './confirm-delete.dialog';
+import { 
+  getDisplayColumns, 
+  getPrimaryKeyValues, 
+  formatCellValue,
+  getRowVersion 
+} from './utils';
+
+@Component({
+  selector: 'app-data-grid',
+  standalone: true,
+  imports: [
+    CommonModule,
+    MatTableModule,
+    MatPaginatorModule,
+    MatSortModule,
+    MatButtonModule,
+    MatIconModule,
+    MatMenuModule,
+    MatTooltipModule,
+    MatProgressSpinnerModule,
+    MatSnackBarModule
+  ],
+  template: `
+    <div class="data-grid-container">
+      <!-- Grid Header -->
+      <div class="grid-header">
+        <div class="grid-title">
+          <h3>{{ meta?.id?.table || 'Data' }}</h3>
+          <span class="record-count" *ngIf="!loading()">
+            {{ totalRecords() | number }} records
+          </span>
+        </div>
+        
+        <div class="grid-actions">
+          <button 
+            mat-raised-button 
+            color="primary"
+            (click)="openEditDialog()"
+            data-testid="addRow">
+            <mat-icon>add</mat-icon>
+            Add Record
+          </button>
+          
+          <button 
+            mat-button
+            (click)="refresh()"
+            [disabled]="loading()"
+            matTooltip="Refresh data">
+            <mat-icon>refresh</mat-icon>
+          </button>
+        </div>
+      </div>
+
+      <!-- Loading State -->
+      @if (loading()) {
+        <div class="loading-container">
+          <mat-spinner diameter="40"></mat-spinner>
+          <p>Loading data...</p>
+        </div>
+      } @else {
+        <!-- Data Table -->
+        <div class="table-container">
+          <table 
+            mat-table 
+            [dataSource]="dataSource" 
+            matSort
+            (matSortChange)="onSortChange($event)"
+            class="data-table">
+            
+            <!-- Dynamic Columns -->
+            @for (column of displayedColumns; track column) {
+              <ng-container [matColumnDef]="column">
+                <th mat-header-cell *matHeaderCellDef mat-sort-header>
+                  {{ column }}
+                </th>
+                <td mat-cell *matCellDef="let row" [title]="formatCellValue(row[column])">
+                  {{ formatCellValue(row[column]) }}
+                </td>
+              </ng-container>
+            }
+
+            <!-- Actions Column -->
+            <ng-container matColumnDef="actions">
+              <th mat-header-cell *matHeaderCellDef class="actions-header">Actions</th>
+              <td mat-cell *matCellDef="let row" class="actions-cell">
+                <button 
+                  mat-icon-button
+                  (click)="openEditDialog(row)"
+                  matTooltip="Edit record"
+                  data-testid="editRow">
+                  <mat-icon>edit</mat-icon>
+                </button>
+                
+                <button 
+                  mat-icon-button
+                  color="warn"
+                  (click)="openDeleteDialog(row)"
+                  matTooltip="Delete record"
+                  data-testid="deleteRow">
+                  <mat-icon>delete</mat-icon>
+                </button>
+                
+                <button 
+                  mat-icon-button
+                  [matMenuTriggerFor]="rowMenu"
+                  matTooltip="More actions">
+                  <mat-icon>more_vert</mat-icon>
+                </button>
+                
+                <mat-menu #rowMenu="matMenu">
+                  <button mat-menu-item (click)="duplicateRow(row)">
+                    <mat-icon>content_copy</mat-icon>
+                    Duplicate
+                  </button>
+                  <button mat-menu-item (click)="viewRowDetails(row)">
+                    <mat-icon>visibility</mat-icon>
+                    View Details
+                  </button>
+                </mat-menu>
+              </td>
+            </ng-container>
+
+            <tr mat-header-row *matHeaderRowDef="allColumns"></tr>
+            <tr mat-row *matRowDef="let row; columns: allColumns;" 
+                [class.selected-row]="isRowSelected(row)"
+                (click)="selectRow(row)"></tr>
+          </table>
+          
+          <!-- No Data Message -->
+          @if (dataSource.data.length === 0 && !loading()) {
+            <div class="no-data">
+              <mat-icon>inbox</mat-icon>
+              <p>No records found</p>
+              <button mat-raised-button color="primary" (click)="openEditDialog()">
+                Add First Record
+              </button>
+            </div>
+          }
+        </div>
+
+        <!-- Paginator -->
+        <mat-paginator
+          [length]="totalRecords()"
+          [pageSize]="pageSize()"
+          [pageSizeOptions]="[10, 25, 50, 100]"
+          [pageIndex]="currentPage()"
+          (page)="onPageChange($event)"
+          showFirstLastButtons>
+        </mat-paginator>
+      }
+    </div>
+  `,
+  styles: [`
+    .data-grid-container {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+
+    .grid-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 24px;
+      border-bottom: 1px solid #e0e0e0;
+    }
+
+    .grid-title h3 {
+      margin: 0;
+      color: #333;
+    }
+
+    .record-count {
+      color: #666;
+      font-size: 14px;
+      margin-left: 8px;
+    }
+
+    .grid-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .loading-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+      min-height: 200px;
+    }
+
+    .loading-container p {
+      margin-top: 16px;
+      color: #666;
+    }
+
+    .table-container {
+      flex: 1;
+      overflow: auto;
+      position: relative;
+    }
+
+    .data-table {
+      width: 100%;
+      min-width: 600px;
+    }
+
+    .data-table th {
+      background-color: #f5f5f5;
+      font-weight: 600;
+      color: #333;
+    }
+
+    .data-table td {
+      border-bottom: 1px solid #e0e0e0;
+      max-width: 200px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .actions-header {
+      width: 120px;
+      text-align: center;
+    }
+
+    .actions-cell {
+      text-align: center;
+      width: 120px;
+    }
+
+    .actions-cell button {
+      margin: 0 2px;
+    }
+
+    .selected-row {
+      background-color: #e3f2fd !important;
+    }
+
+    .data-table tr:hover {
+      background-color: #f5f5f5;
+      cursor: pointer;
+    }
+
+    .no-data {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+      color: #666;
+    }
+
+    .no-data mat-icon {
+      font-size: 48px;
+      width: 48px;
+      height: 48px;
+      margin-bottom: 16px;
+      color: #ccc;
+    }
+
+    .no-data p {
+      margin: 0 0 16px 0;
+      font-size: 16px;
+    }
+
+    mat-paginator {
+      border-top: 1px solid #e0e0e0;
+    }
+  `]
+})
+export class DataGridComponent implements OnInit, OnDestroy {
+  @Input() meta: TableMetadata | null = null;
+  @Input() schemaTable: string = '';
+  @Input() filters: DataGridFilter[] = [];
+  
+  @Output() filtersChange = new EventEmitter<DataGridFilter[]>();
+  @Output() dataChanged = new EventEmitter<void>();
+
+  @ViewChild(MatPaginator) paginator!: MatPaginator;
+  @ViewChild(MatSort) sort!: MatSort;
+
+  dataSource = new MatTableDataSource<any>([]);
+  displayedColumns: string[] = [];
+  allColumns: string[] = [];
+  
+  loading = signal(false);
+  totalRecords = signal(0);
+  currentPage = signal(0);
+  pageSize = signal(25);
+  sortBy = signal<string>('');
+  sortDirection = signal<'asc' | 'desc'>('asc');
+  selectedRow = signal<any>(null);
+
+  private destroy$ = new Subject<void>();
+
+  constructor(
+    private dataService: AdminDataService,
+    private dialog: MatDialog,
+    private snackBar: MatSnackBar
+  ) {}
+
+  ngOnInit(): void {
+    if (this.meta) {
+      this.setupColumns();
+      this.loadData();
+    }
+  }
+
+  ngOnDestroy(): void {
+    this.destroy$.next();
+    this.destroy$.complete();
+  }
+
+  private setupColumns(): void {
+    if (!this.meta) return;
+    
+    this.displayedColumns = getDisplayColumns(this.meta);
+    this.allColumns = [...this.displayedColumns, 'actions'];
+  }
+
+  private async loadData(): Promise<void> {
+    if (!this.schemaTable || this.loading()) return;
+
+    this.loading.set(true);
+
+    try {
+      const response = await this.dataService.getData(
+        this.schemaTable,
+        this.currentPage() * this.pageSize(),
+        this.pageSize(),
+        this.buildSortOptions(),
+        this.buildFilterOptions()
+      ).toPromise();
+
+      if (response) {
+        this.dataSource.data = response.data;
+        this.totalRecords.set(response.total);
+      }
+
+    } catch (error: any) {
+      this.snackBar.open(
+        error.error?.message || 'Failed to load data',
+        'Close',
+        { duration: 5000 }
+      );
+    } finally {
+      this.loading.set(false);
+    }
+  }
+
+  private buildSortOptions(): SortOption[] {
+    if (!this.sortBy()) return [];
+    
+    return [{
+      column: this.sortBy(),
+      direction: this.sortDirection()
+    }];
+  }
+
+  private buildFilterOptions(): FilterOption[] {
+    return this.filters.map(filter => ({
+      column: filter.column,
+      operator: filter.operator,
+      value: filter.value
+    }));
+  }
+
+  onPageChange(event: PageEvent): void {
+    this.currentPage.set(event.pageIndex);
+    this.pageSize.set(event.pageSize);
+    this.loadData();
+  }
+
+  onSortChange(sort: Sort): void {
+    this.sortBy.set(sort.active);
+    this.sortDirection.set(sort.direction || 'asc');
+    this.currentPage.set(0); // Reset to first page
+    this.loadData();
+  }
+
+  refresh(): void {
+    this.currentPage.set(0);
+    this.loadData();
+    this.dataChanged.emit();
+  }
+
+  selectRow(row: any): void {
+    this.selectedRow.set(row);
+  }
+
+  isRowSelected(row: any): boolean {
+    if (!this.selectedRow() || !this.meta) return false;
+    
+    const selectedKeys = getPrimaryKeyValues(this.selectedRow(), this.meta.primaryKey);
+    const rowKeys = getPrimaryKeyValues(row, this.meta.primaryKey);
+    
+    return JSON.stringify(selectedKeys) === JSON.stringify(rowKeys);
+  }
+
+  openEditDialog(row?: any): void {
+    if (!this.meta) return;
+
+    const dialogRef = this.dialog.open(EditDialogComponent, {
+      width: '600px',
+      maxHeight: '90vh',
+      data: {
+        meta: this.meta,
+        schemaTable: this.schemaTable,
+        row: row || null
+      },
+      disableClose: true
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      if (result) {
+        this.refresh();
+      }
+    });
+  }
+
+  openDeleteDialog(row: any): void {
+    if (!this.meta) return;
+
+    const primaryKey = getPrimaryKeyValues(row, this.meta.primaryKey);
+    const displayValue = this.getRowDisplayValue(row);
+
+    const dialogRef = this.dialog.open(ConfirmDeleteDialogComponent, {
+      width: '400px',
+      data: {
+        entityName: this.meta.id.table,
+        displayValue: displayValue
+      }
+    });
+
+    dialogRef.afterClosed().subscribe(async (confirmed) => {
+      if (confirmed) {
+        await this.deleteRow(row);
+      }
+    });
+  }
+
+  private async deleteRow(row: any): Promise<void> {
+    if (!this.meta) return;
+
+    try {
+      const primaryKey = getPrimaryKeyValues(row, this.meta.primaryKey);
+      const rowVersion = getRowVersion(row, this.meta.columns);
+
+      await this.dataService.delete(
+        this.schemaTable,
+        primaryKey,
+        rowVersion
+      ).toPromise();
+
+      this.snackBar.open('Record deleted successfully', 'Close', { duration: 3000 });
+      this.refresh();
+
+    } catch (error: any) {
+      this.snackBar.open(
+        error.error?.message || 'Failed to delete record',
+        'Close',
+        { duration: 5000 }
+      );
+    }
+  }
+
+  duplicateRow(row: any): void {
+    if (!this.meta) return;
+
+    // Create a copy without primary key and audit fields
+    const duplicateData = { ...row };
+    
+    // Remove primary key columns
+    this.meta.primaryKey.forEach(pkCol => {
+      delete duplicateData[pkCol];
+    });
+
+    // Remove auto-generated columns (identity, timestamp, audit fields)
+    this.meta.columns.forEach(col => {
+      if (col.IsIdentity || 
+          col.SqlType.toLowerCase() === 'timestamp' ||
+          col.SqlType.toLowerCase() === 'rowversion' ||
+          col.ColumnName.toLowerCase().includes('created') ||
+          col.ColumnName.toLowerCase().includes('modified')) {
+        delete duplicateData[col.ColumnName];
+      }
+    });
+
+    this.openEditDialog(duplicateData);
+  }
+
+  viewRowDetails(row: any): void {
+    // TODO: Implement detailed view dialog
+    console.log('View details for row:', row);
+    this.snackBar.open('Detailed view not implemented yet', 'Close', { duration: 3000 });
+  }
+
+  private getRowDisplayValue(row: any): string {
+    if (!this.meta) return 'Unknown';
+
+    // Try to find a good display column (name, title, description, etc.)
+    const displayCandidates = ['name', 'title', 'description', 'label'];
+    
+    for (const candidate of displayCandidates) {
+      const column = this.meta.columns.find(col => 
+        col.ColumnName.toLowerCase().includes(candidate)
+      );
+      if (column && row[column.ColumnName]) {
+        return row[column.ColumnName];
+      }
+    }
+
+    // Fall back to primary key values
+    const pkValues = getPrimaryKeyValues(row, this.meta.primaryKey);
+    return Object.values(pkValues).join(', ');
+  }
+
+  // Expose utility function to template
+  formatCellValue = formatCellValue;
+}
